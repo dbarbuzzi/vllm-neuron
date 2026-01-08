@@ -1,0 +1,118 @@
+# syntax=docker/dockerfile:1
+# check=skip=InvalidDefaultArgInFrom # defaults are specified in bakefiles
+
+ARG BASE_UBI_IMAGE_TAG
+ARG PYTHON_VERSION
+
+## Base ########################################################################
+FROM registry.access.redhat.com/ubi9/ubi:${BASE_UBI_IMAGE_TAG} AS base
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+RUN dnf update -y \
+    && dnf swap -y curl-minimal curl \
+    && dnf install -y \
+        cmake \
+        gcc \
+        gcc-c++ \
+        git \
+        libxcrypt-compat \
+        python${PYTHON_VERSION}-pip \
+        python${PYTHON_VERSION}-wheel \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+WORKDIR /workspace
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+# Some utils for dev purposes - tar required for kubectl cp
+RUN dnf install -y \
+        findutils \
+        procps \
+        tar \
+        which \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+
+## Neuron ######################################################################
+FROM base AS neuron-base
+
+# TODO: have args to control neuron versioning
+
+# TODO: better way to create this file than disjoint echos
+ENV REPO_FILE=/etc/yum.repos.d/neuron.repo
+RUN echo "[neuron]" > "${REPO_FILE}" \
+    && echo "name=Neuron YUM Repository" >> "${REPO_FILE}" \
+    && echo "baseurl=https://yum.repos.neuron.amazonaws.com" >> "${REPO_FILE}" \
+    && echo "enabled=1" >> "${REPO_FILE}" \
+    && echo "metadata_expire=0" >> "${REPO_FILE}" \
+    && rpm --import https://yum.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB
+
+RUN dnf install -y --nobest \
+        aws-neuronx-collectives-2.* \
+        aws-neuronx-runtime-lib-2.* \
+        aws-neuronx-tools-2.* \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+## Python ######################################################################
+FROM neuron-base AS python-install
+
+ARG PYTHON_VERSION
+ENV UV_EXTRA_INDEX_URL=https://pip.repos.neuron.amazonaws.com
+ENV UV_INDEX_STRATEGY=unsafe-best-match
+
+ENV VIRTUAL_ENV=/opt/vllm
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+RUN dnf install -y python${PYTHON_VERSION}-devel \
+    && python${PYTHON_VERSION} -m venv "$VIRTUAL_ENV" \
+    && pip install --no-cache -U pip wheel uv \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+## Release #####################################################################
+FROM python-install AS vllm-openapi
+ARG PYTHON_VERSION
+
+WORKDIR /workspace
+ENV VIRTUAL_ENV=/opt/vllm
+ENV PATH="$VIRTUAL_ENV/bin:/opt/aws/neuron/bin:$PATH"
+ENV NEURON_RUNTIME_PATH=/opt/aws/neuron
+ENV LD_LIBRARY_PATH=/opt/aws/neuron/lib:/usr/lib64
+
+COPY LICENSE /licenses/vllm.md
+
+# install vllm (and any other dependencies) by running the payload script
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,src=payload,target=/workspace/payload \
+    ./payload/run.sh
+
+ENV HF_HUB_OFFLINE=1 \
+    HOME=/home/vllm \
+    VLLM_USAGE_STATS_SERVER=https://console.redhat.com/api/rhaiis-stats \
+    VLLM_USAGE_SOURCE=quay-docker-image \
+    VLLM_CACHE_ROOT=/tmp/vllm
+
+# setup non-root user for OpenShift
+RUN umask 002 && \
+    useradd --uid 2000 --gid 0 vllm && \
+    mkdir -p /home/vllm && \
+    chmod g+rwx /home/vllm
+
+# pre-download tiktoken/harmony tokenizer for disconnected environments
+# openai_harmony uses TIKTOKEN_RS_CACHE_DIR
+# while the python tiktoken module uses TIKTOKEN_CACHE_DIR
+ENV TIKTOKEN_CACHE_DIR=${HOME}/.cache/tiktoken
+ENV TIKTOKEN_RS_CACHE_DIR=${TIKTOKEN_CACHE_DIR}
+RUN --mount=type=bind,src=tools/predownload_tiktoken_tokenizers.py,target=predownload_tiktoken_tokenizers.py \
+    python predownload_tiktoken_tokenizers.py \
+    && chmod g+rwx "${TIKTOKEN_CACHE_DIR}" \
+    && chown -R vllm:0 ~/.cache
+
+USER 2000
+WORKDIR /home/vllm
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
