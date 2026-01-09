@@ -50,10 +50,18 @@ RUN echo "[neuron]" > "${REPO_FILE}" \
     && echo "metadata_expire=0" >> "${REPO_FILE}" \
     && rpm --import https://yum.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB
 
+# aws-neuronx-collectives-2.29.x requires "libatomic" and "hwloc-devel", but
+# "hwloc-devel" isn't available in UBI 9’s CRB/EPEL (?), so we install it
+# one without deps
+RUN dnf download aws-neuronx-collectives-2.* \
+    && rpm -ivh --nodeps aws-neuronx-collectives*.rpm \
+    && rm -f aws-neuronx-collectives*.rpm
+
+# libatomic is a dependency of "aws-neuronx-collectives-2.29.x"
 RUN dnf install -y --nobest \
-        aws-neuronx-collectives-2.* \
         aws-neuronx-runtime-lib-2.* \
         aws-neuronx-tools-2.* \
+        libatomic \
     && dnf clean all \
     && rm -rf /var/cache/dnf
 
